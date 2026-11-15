@@ -12,7 +12,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 # Install the published OpenClaw release
-RUN npm install -g openclaw@2026.11.3 \
+RUN npm install -g openclaw@2026.9.7 \
   && openclaw --version
 
 # Keep user-installed tools on Railway's persistent volume
