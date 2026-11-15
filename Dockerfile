@@ -1,4 +1,4 @@
-# Build openclaw from source to avoid npm packaging gaps (some dist files are not shipped).
+# Rebuild with Node.js 24 # Build openclaw from source to avoid npm packaging gaps (some dist files are not shipped).
 FROM node:24-bookworm AS openclaw-build
 
 # Dependencies needed for openclaw build
