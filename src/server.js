@@ -1313,7 +1313,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
-  xfwd: true,
+  xfwd: false,
 });
 
 proxy.on("error", (err, _req, res) => {
