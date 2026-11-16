@@ -1331,24 +1331,68 @@ proxy.on("error", (err, _req, res) => {
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
 // not just the /setup routes.  Healthcheck is excluded so Railway probes work.
+
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
-  if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
-  if (!SETUP_PASSWORD) return next(); // no password configured → open
+  if (req.path.startsWith("/hooks")) return next();
+  if (!SETUP_PASSWORD) return next();
+
+  // Secure session cookie based on the existing setup password.
+  const sessionName = "openclaw_dashboard_session";
+  const sessionValue = crypto
+    .createHmac("sha256", SETUP_PASSWORD)
+    .update("openclaw-dashboard-session-v1")
+    .digest("hex");
+
+  const cookies = (req.headers.cookie || "")
+    .split(";")
+    .map(s => s.trim());
+
+  const sessionCookie = cookies
+    .find(s => s.startsWith(sessionName + "="))
+    ?.slice(sessionName.length + 1);
+
+  if (sessionCookie && /^[a-f0-9]{64}$/.test(sessionCookie)) {
+    const supplied = Buffer.from(sessionCookie, "hex");
+    const expected = Buffer.from(sessionValue, "hex");
+
+    if (crypto.timingSafeEqual(supplied, expected)) {
+      return next();
+    }
+  }
+
+  // Accept Basic authentication and create a browser session.
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Auth required");
+
+  if (scheme === "Basic" && encoded) {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+
+    if (password === SETUP_PASSWORD) {
+      res.cookie(sessionName, sessionValue, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "strict",
+        path: "/",
+        maxAge: 24 * 60 * 60 * 1000
+      });
+
+      return next();
+    }
   }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
+
+  // Only prompt for credentials on the dashboard page.
+  const isDashboardPage =
+    req.method === "GET" &&
+    (req.path === "/openclaw" || req.path === "/openclaw/");
+
+  if (isDashboardPage) {
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Invalid password");
   }
-  return next();
+
+  return res.status(401).send("Authentication required");
 }
 
 // --- Gateway token injection ---
