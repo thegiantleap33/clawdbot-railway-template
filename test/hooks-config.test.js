@@ -6,6 +6,8 @@ import {
   isCustomHooksPath,
   parseConfigGetResult,
   planHooksConfigWrites,
+  planWrapperSessionUnsets,
+  resolveHookSessionPrefix,
 } from "../src/hooks-config.js";
 
 test("hooksExplicitlyDisabled only accepts the string false", () => {
@@ -72,6 +74,63 @@ test("planHooksConfigWrites allows a persistent session prefix when configured",
     writes.find((write) => write.path === "hooks.allowedSessionKeyPrefixes").value,
     ["hook:gazza:"],
   );
+  assert.equal(writes.find((write) => write.path === "hooks.defaultSessionKey").value, "hook:gazza:main");
+  assert.equal(
+    writes.find((write) => write.path === "hooks.allowedSessionKeyPrefixes").value.includes("hook:"),
+    false,
+  );
+});
+
+test("resolveHookSessionPrefix rejects prefixes outside the hook: namespace", () => {
+  assert.equal(resolveHookSessionPrefix("gazza:").ok, false);
+  assert.equal(resolveHookSessionPrefix("hook:gazza:with space").ok, false);
+  assert.deepEqual(resolveHookSessionPrefix("hook:gazza"), {
+    ok: true,
+    prefix: "hook:gazza",
+    defaultSessionKey: "hook:gazza:main",
+  });
+  const writes = planHooksConfigWrites({
+    token: "hook-env-token",
+    explicitlyDisabled: false,
+    currentPath: "/hooks",
+    allowedAgentIds: ["main"],
+    sessionKeyPrefix: "not-a-hook:",
+  });
+  assert.equal(writes.find((write) => write.path === "hooks.allowRequestSessionKey").value, false);
+  assert.equal(writes.some((write) => write.path === "hooks.allowedSessionKeyPrefixes"), false);
+  assert.equal(writes.some((write) => write.path === "hooks.defaultSessionKey"), false);
+});
+
+test("clearing the session prefix unsets wrapper-owned hook session keys", () => {
+  assert.deepEqual(planWrapperSessionUnsets({
+    sessionKeyPrefix: "",
+    allowedSessionKeyPrefixes: ["hook:gazza:"],
+    defaultSessionKey: undefined,
+  }), ["hooks.allowedSessionKeyPrefixes"]);
+
+  assert.deepEqual(planWrapperSessionUnsets({
+    sessionKeyPrefix: "  ",
+    allowedSessionKeyPrefixes: ["hook:gazza:"],
+    defaultSessionKey: "hook:gazza:main",
+  }), ["hooks.allowedSessionKeyPrefixes", "hooks.defaultSessionKey"]);
+
+  assert.deepEqual(planWrapperSessionUnsets({
+    sessionKeyPrefix: "",
+    allowedSessionKeyPrefixes: ["hook:gazza:", "hook:"],
+    defaultSessionKey: undefined,
+  }), []);
+
+  assert.deepEqual(planWrapperSessionUnsets({
+    sessionKeyPrefix: "",
+    allowedSessionKeyPrefixes: ["hook:gazza:"],
+    defaultSessionKey: "hook:gazza:inbox",
+  }), []);
+
+  assert.deepEqual(planWrapperSessionUnsets({
+    sessionKeyPrefix: "hook:gazza:",
+    allowedSessionKeyPrefixes: ["hook:gazza:"],
+    defaultSessionKey: undefined,
+  }), []);
 });
 
 test("planHooksConfigWrites ignores a session prefix when hooks are disabled", () => {

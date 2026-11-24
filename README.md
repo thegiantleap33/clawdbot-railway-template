@@ -36,7 +36,7 @@ Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
 - `OPENCLAW_HOOKS_TOKEN` — dedicated `hooks.token` for `POST /hooks/*`. When set (and OpenClaw is already configured), the wrapper writes the token and enables hooks on startup and after setup: `hooks.enabled=true`, `hooks.path="/hooks"` (an existing non-default path is kept), `hooks.allowedAgentIds=["main"]` unless that list is already set, and `hooks.allowRequestSessionKey=false` unless `OPENCLAW_HOOKS_SESSION_PREFIX` is set. The gateway is started only after those writes, and restarted if it was already running. Use a different value from `OPENCLAW_GATEWAY_TOKEN`.
 - `OPENCLAW_HOOKS_ENABLED` — set to `false` to store the hook token without enabling hook ingress. Any other value, including unset, enables hooks when `OPENCLAW_HOOKS_TOKEN` is set.
-- `OPENCLAW_HOOKS_SESSION_PREFIX` — for example `hook:gazza:`. Lets a caller choose a persistent session key that starts with this prefix (`hooks.allowRequestSessionKey=true` and `hooks.allowedSessionKeyPrefixes`).
+- `OPENCLAW_HOOKS_SESSION_PREFIX` — for example `hook:gazza:`. Must start with `hook:`. The wrapper sets `hooks.allowRequestSessionKey=true`, `hooks.allowedSessionKeyPrefixes` to that prefix only (not the bare `hook:` prefix), and `hooks.defaultSessionKey` to `hook:gazza:main`. Clearing the variable removes those two keys when the wrapper wrote them, so the gateway can boot again.
 - `OPENCLAW_GROK_CALLBACK_URL` — where the wrapper POSTs the finished reply for a run under that prefix.
 - `OPENCLAW_GROK_CALLBACK_TOKEN` — bearer token for that callback. It is not logged.
 

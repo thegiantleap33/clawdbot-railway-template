@@ -44,10 +44,67 @@ export function isCustomHooksPath(value) {
   return path !== "/hooks";
 }
 
+// OpenClaw refuses to boot when allowedSessionKeyPrefixes is set, defaultSessionKey
+// is unset, and the allowlist does not cover generated `hook:<uuid>` keys.
+// A specific prefix such as hook:gazza: needs a default key inside that prefix.
+// Do not add the bare "hook:" prefix; that would allow every hook session key.
+export function resolveHookSessionPrefix(sessionKeyPrefix) {
+  const prefix = String(sessionKeyPrefix ?? "").trim();
+  if (!prefix) return { ok: true, prefix: "" };
+  if (!prefix.toLowerCase().startsWith("hook:")) {
+    return { ok: false, error: "OPENCLAW_HOOKS_SESSION_PREFIX must start with hook:" };
+  }
+  if (/[\s\p{Cc}]/u.test(prefix)) {
+    return { ok: false, error: "OPENCLAW_HOOKS_SESSION_PREFIX must not contain whitespace" };
+  }
+  const defaultSessionKey = prefix.endsWith(":")
+    ? `${prefix}main`
+    : prefix.toLowerCase().endsWith(":main")
+      ? prefix
+      : `${prefix}:main`;
+  if (!defaultSessionKey.toLowerCase().startsWith(prefix.toLowerCase())) {
+    return { ok: false, error: "hooks.defaultSessionKey must start with the session prefix" };
+  }
+  return { ok: true, prefix, defaultSessionKey };
+}
+
+function admitsGeneratedHookKey(prefixes) {
+  return prefixes.some((prefix) => "hook:example".startsWith(prefix.toLowerCase()));
+}
+
+// Drop wrapper-owned session policy when OPENCLAW_HOOKS_SESSION_PREFIX is empty.
+// That includes the crashing shape (a single hook: prefix and no default key)
+// and the pair this wrapper writes (`${prefix}main`). Leave any other list alone.
+export function planWrapperSessionUnsets({
+  sessionKeyPrefix,
+  allowedSessionKeyPrefixes,
+  defaultSessionKey,
+}) {
+  const requested = resolveHookSessionPrefix(sessionKeyPrefix);
+  if (!requested.ok || requested.prefix) return [];
+  if (!Array.isArray(allowedSessionKeyPrefixes)) return [];
+  const prefixes = allowedSessionKeyPrefixes
+    .map((prefix) => String(prefix ?? "").trim())
+    .filter(Boolean);
+  if (prefixes.length !== 1) return [];
+  const prefix = prefixes[0];
+  if (!prefix.toLowerCase().startsWith("hook:")) return [];
+  const expected = resolveHookSessionPrefix(prefix);
+  if (!expected.ok) return [];
+  const currentDefault = typeof defaultSessionKey === "string" ? defaultSessionKey.trim() : "";
+  const wrapperPair = currentDefault === expected.defaultSessionKey;
+  const crashesWithoutDefault = !currentDefault && !admitsGeneratedHookKey(prefixes);
+  if (!wrapperPair && !crashesWithoutDefault) return [];
+  const unsets = ["hooks.allowedSessionKeyPrefixes"];
+  if (currentDefault) unsets.push("hooks.defaultSessionKey");
+  return unsets;
+}
+
 // Writes applied with `openclaw config set --json`, same as hooks.token.
 // `allowedAgentIds` is omitted when it is already an array (including []).
 // A non-default hooks.path is left alone.
-// A session prefix opts into persistent caller-selected keys bounded to that prefix.
+// A valid session prefix opts into persistent caller-selected keys and sets
+// hooks.defaultSessionKey so the gateway can boot.
 export function planHooksConfigWrites({
   token,
   explicitlyDisabled,
@@ -68,10 +125,11 @@ export function planHooksConfigWrites({
   if (!Array.isArray(allowedAgentIds)) {
     writes.push({ path: "hooks.allowedAgentIds", value: ["main"] });
   }
-  const prefix = String(sessionKeyPrefix ?? "").trim();
-  if (prefix) {
+  const session = resolveHookSessionPrefix(sessionKeyPrefix);
+  if (session.ok && session.prefix) {
     writes.push({ path: "hooks.allowRequestSessionKey", value: true });
-    writes.push({ path: "hooks.allowedSessionKeyPrefixes", value: [prefix] });
+    writes.push({ path: "hooks.allowedSessionKeyPrefixes", value: [session.prefix] });
+    writes.push({ path: "hooks.defaultSessionKey", value: session.defaultSessionKey });
   } else {
     writes.push({ path: "hooks.allowRequestSessionKey", value: false });
   }
