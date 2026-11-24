@@ -70,6 +70,10 @@ function resolveGatewayToken() {
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 
+// Dedicated OpenClaw hook ingress secret (hooks.token in openclaw.json).
+// This is not dashboard auth and must not be reused as the gateway token.
+const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN?.trim() || "";
+
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
@@ -295,9 +299,29 @@ function requireSetupAuth(req, res, next) {
   return next();
 }
 
+function requestPath(req) {
+  if (typeof req.path === "string" && req.path.length > 0) return req.path;
+  const raw = req.url || "/";
+  const q = raw.indexOf("?");
+  return (q === -1 ? raw : raw.slice(0, q)) || "/";
+}
+
+// OpenClaw hook ingress (/hooks, /hooks/agent, /hooks/wake, ...).
+// Callers authenticate with hooks.token, not the dashboard password or gateway token.
+function isHooksRequest(req) {
+  const p = requestPath(req);
+  return p === "/hooks" || p.startsWith("/hooks/");
+}
+
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
+const jsonParser = express.json({ limit: "1mb" });
+// /hooks must keep its raw body. express.json() would consume it and the proxy
+// would forward an empty payload to the gateway.
+app.use((req, res, next) => {
+  if (isHooksRequest(req)) return next();
+  return jsonParser(req, res, next);
+});
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
@@ -747,6 +771,11 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
+
+    if (OPENCLAW_HOOKS_TOKEN) {
+      const hooksSet = await syncHooksTokenFromEnv();
+      extra += `\n[hooks.token] exit=${hooksSet.code} (output ${hooksSet.output.length} chars)\n${hooksSet.output || "(no output)"}`;
+    }
 
     // Railway runs behind a reverse proxy. Trust loopback as a proxy hop so local client detection
     // remains correct when X-Forwarded-* headers are present.
@@ -1331,56 +1360,82 @@ proxy.on("error", (err, _req, res) => {
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
 // not just the /setup routes.  Healthcheck is excluded so Railway probes work.
+// /hooks is excluded so external callers can use OpenClaw's own hooks.token.
 
-function requireDashboardAuth(req, res, next) {
-  if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
-  if (req.path.startsWith("/hooks")) return next();
-  if (!SETUP_PASSWORD) return next();
+const DASHBOARD_SESSION_COOKIE = "openclaw_dashboard_session";
 
-  // Secure session cookie based on the existing setup password.
-  const sessionName = "openclaw_dashboard_session";
-  const sessionValue = crypto
+function dashboardSessionValue() {
+  if (!SETUP_PASSWORD) return "";
+  return crypto
     .createHmac("sha256", SETUP_PASSWORD)
     .update("openclaw-dashboard-session-v1")
     .digest("hex");
+}
 
-  const cookies = (req.headers.cookie || "")
+function readCookie(req, name) {
+  const cookies = String(req.headers.cookie || "")
     .split(";")
-    .map(s => s.trim());
+    .map((s) => s.trim());
+  const match = cookies.find((s) => s.startsWith(name + "="));
+  return match ? match.slice(name.length + 1) : "";
+}
 
-  const sessionCookie = cookies
-    .find(s => s.startsWith(sessionName + "="))
-    ?.slice(sessionName.length + 1);
+function hasValidDashboardSession(req) {
+  if (!SETUP_PASSWORD) return false;
+  const sessionCookie = readCookie(req, DASHBOARD_SESSION_COOKIE);
+  if (!/^[a-f0-9]{64}$/.test(sessionCookie)) return false;
+  const supplied = Buffer.from(sessionCookie, "hex");
+  const expected = Buffer.from(dashboardSessionValue(), "hex");
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
 
-  if (sessionCookie && /^[a-f0-9]{64}$/.test(sessionCookie)) {
-    const supplied = Buffer.from(sessionCookie, "hex");
-    const expected = Buffer.from(sessionValue, "hex");
-
-    if (crypto.timingSafeEqual(supplied, expected)) {
-      return next();
-    }
-  }
-
-  // Accept Basic authentication and create a browser session.
+function hasValidSetupBasicAuth(req) {
+  if (!SETUP_PASSWORD) return false;
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) return false;
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  return password === SETUP_PASSWORD;
+}
 
-  if (scheme === "Basic" && encoded) {
-    const decoded = Buffer.from(encoded, "base64").toString("utf8");
-    const idx = decoded.indexOf(":");
-    const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+// Same rule as HTTP dashboard routes: open when no password is configured,
+// otherwise accept the session cookie or HTTP Basic with SETUP_PASSWORD.
+function dashboardAuthSatisfied(req) {
+  if (!SETUP_PASSWORD) return true;
+  return hasValidDashboardSession(req) || hasValidSetupBasicAuth(req);
+}
 
-    if (password === SETUP_PASSWORD) {
-      res.cookie(sessionName, sessionValue, {
-        httpOnly: true,
-        secure: true,
-        sameSite: "strict",
-        path: "/",
-        maxAge: 24 * 60 * 60 * 1000
-      });
+// Browsers store Secure cookies only on HTTPS. Railway terminates TLS and sends
+// X-Forwarded-Proto; local HTTP must omit Secure so the Control UI can include
+// the session cookie on its WebSocket handshake.
+function requestIsHttps(req) {
+  if (req.secure) return true;
+  const proto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  return proto === "https";
+}
 
-      return next();
-    }
+function requireDashboardAuth(req, res, next) {
+  if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
+  if (isHooksRequest(req)) return next();
+  if (!SETUP_PASSWORD) return next();
+
+  if (hasValidDashboardSession(req)) return next();
+
+  if (hasValidSetupBasicAuth(req)) {
+    res.cookie(DASHBOARD_SESSION_COOKIE, dashboardSessionValue(), {
+      httpOnly: true,
+      secure: requestIsHttps(req),
+      sameSite: "strict",
+      path: "/",
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    return next();
   }
 
   // Only prompt for credentials on the dashboard page.
@@ -1398,17 +1453,25 @@ function requireDashboardAuth(req, res, next) {
 // --- Gateway token injection ---
 // The gateway is only reachable from this container. The Control UI in the browser
 // cannot set custom Authorization headers for WebSocket connections, so we inject
-// the token into proxied requests at the wrapper level.
+// the gateway token into proxied dashboard requests.
+//
+// Hook routes are the exception. OpenClaw's hook auth prefers a nonempty
+// Authorization: Bearer token over x-openclaw-token. Replacing Authorization with
+// the gateway token would discard the caller's hooks.token and the gateway would
+// reject POST /hooks/agent. Leave both headers untouched.
 
-function attachGatewayAuthHeader(req) {
-  if (OPENCLAW_GATEWAY_TOKEN) {
-    req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+function attachGatewayAuthHeader(req, proxyReq) {
+  if (isHooksRequest(req)) return;
+  if (!OPENCLAW_GATEWAY_TOKEN) return;
+  const value = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+  req.headers.authorization = value;
+  if (proxyReq && typeof proxyReq.setHeader === "function") {
+    proxyReq.setHeader("Authorization", value);
   }
 }
 
-
-proxy.on("proxyReqWs", (_proxyReq, req) => {
-  attachGatewayAuthHeader(req);
+proxy.on("proxyReqWs", (proxyReq, req) => {
+  attachGatewayAuthHeader(req, proxyReq);
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
@@ -1492,6 +1555,17 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     }
   }
 
+  if (isConfigured() && OPENCLAW_HOOKS_TOKEN) {
+    console.log("[wrapper] syncing hooks.token in config...");
+    try {
+      const hooksSet = await syncHooksTokenFromEnv();
+      if (hooksSet.code === 0) console.log("[wrapper] hooks.token synced");
+      else console.warn(`[wrapper] failed to sync hooks.token (exit ${hooksSet.code})`);
+    } catch (err) {
+      console.warn(`[wrapper] failed to sync hooks.token: ${String(err)}`);
+    }
+  }
+
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
   // work even if nobody visits the web UI.
   if (isConfigured()) {
@@ -1505,19 +1579,56 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   }
 });
 
+function rejectUpgrade(socket, statusCode, message) {
+  const reason =
+    statusCode === 401 ? "Unauthorized" :
+    statusCode === 503 ? "Service Unavailable" :
+    "Error";
+  const body = Buffer.from(String(message).endsWith("\n") ? String(message) : `${message}\n`, "utf8");
+  const header = Buffer.from(
+    `HTTP/1.1 ${statusCode} ${reason}\r\n` +
+      "Content-Type: text/plain; charset=utf-8\r\n" +
+      "Connection: close\r\n" +
+      `Content-Length: ${body.length}\r\n` +
+      "\r\n",
+    "utf8",
+  );
+  socket.on("error", () => {});
+  try {
+    socket.end(Buffer.concat([header, body]));
+  } catch {
+    try { socket.destroy(); } catch {}
+  }
+}
+
+async function syncHooksTokenFromEnv() {
+  return runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "set", "--json", "hooks.token", JSON.stringify(OPENCLAW_HOOKS_TOKEN)]),
+  );
+}
+
 server.on("upgrade", async (req, socket, head) => {
-  // Note: browsers cannot attach arbitrary HTTP headers (including Authorization: Basic)
-  // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
-  // The gateway authenticates at the protocol layer and we inject the gateway token below.
+  // Browsers cannot set Authorization on a WebSocket handshake (issue #162), but
+  // they do send the dashboard session cookie set after SETUP_PASSWORD login.
+  // Require that session, or Basic auth when a client presents it, before
+  // injecting the gateway token. Without this check the public domain would
+  // hand operator-level gateway access to any caller.
+  // /hooks stays exempt and never receives the gateway token.
+  const hooks = isHooksRequest(req);
+  if (!hooks && !dashboardAuthSatisfied(req)) {
+    rejectUpgrade(socket, 401, "Authentication required");
+    return;
+  }
 
   if (!isConfigured()) {
-    socket.destroy();
+    rejectUpgrade(socket, 503, "Gateway not configured");
     return;
   }
   try {
     await ensureGatewayRunning();
   } catch {
-    socket.destroy();
+    rejectUpgrade(socket, 503, "Gateway unavailable");
     return;
   }
   attachGatewayAuthHeader(req);

@@ -13,7 +13,7 @@ This repo packages **OpenClaw** for Railway with a small **/setup** web wizard s
 ## How it works (high level)
 
 - The container runs a wrapper web server.
-- The wrapper protects `/setup` (and the Control UI at `/openclaw`) with `SETUP_PASSWORD` using HTTP Basic auth.
+- The wrapper protects `/setup` and the Control UI with `SETUP_PASSWORD` (HTTP Basic auth, then a session cookie). WebSocket upgrades for the Control UI require that same session. `POST /hooks/*` is the exception: OpenClaw authenticates those with `hooks.token`, not the dashboard password.
 - During setup, the wrapper runs `openclaw onboard --non-interactive ...` inside the container, writes state to the volume, and then starts the gateway.
 - After setup, **`/` is OpenClaw**. The wrapper reverse-proxies all traffic (including WebSockets) to the local gateway process.
 
@@ -34,6 +34,7 @@ Recommended:
 
 Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
+- `OPENCLAW_HOOKS_TOKEN` — dedicated `hooks.token` for `POST /hooks/*`. When set (and OpenClaw is already configured), the wrapper writes it into the config on startup and after setup. Use a different value from `OPENCLAW_GATEWAY_TOKEN`. Hooks still need `hooks.enabled: true` in the OpenClaw config.
 
 Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
@@ -47,6 +48,19 @@ Then:
   - Your browser will prompt for **HTTP Basic auth**. Use any username; the password is `SETUP_PASSWORD`.
 - Complete setup
 - Visit `https://<your-app>.up.railway.app/` and `/openclaw` (same Basic auth)
+
+## Calling webhooks (`/hooks`)
+
+OpenClaw's HTTP hooks are served on the public domain. They do not use `SETUP_PASSWORD` or the gateway token. The wrapper forwards `Authorization` and `x-openclaw-token` unchanged. OpenClaw prefers a nonempty `Authorization: Bearer` value over `x-openclaw-token`, and checks it against `hooks.token`.
+
+```bash
+curl -X POST "https://<your-app>.up.railway.app/hooks/agent" \
+  -H "Authorization: Bearer $OPENCLAW_HOOKS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Summarize this event","name":"Email","agentId":"main"}'
+```
+
+`x-openclaw-token: $OPENCLAW_HOOKS_TOKEN` is also accepted. Enable hooks in the OpenClaw config (`hooks.enabled: true`, path `/hooks`) or the gateway will not serve these routes. The Control UI and `/setup` still require `SETUP_PASSWORD`.
 
 ## Support / community
 
