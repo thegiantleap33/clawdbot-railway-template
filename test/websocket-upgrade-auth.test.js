@@ -20,8 +20,10 @@ test("ws upgrade requires dashboard auth before proxying", () => {
   assert.doesNotMatch(window, /scheme === "Basic"/);
 });
 
-test("wrapper seeds hooks.token from OPENCLAW_HOOKS_TOKEN", () => {
+test("wrapper enables hooks from OPENCLAW_HOOKS_TOKEN without logging the secret", () => {
   const src = fs.readFileSync(new URL("../src/server.js", import.meta.url), "utf8");
   assert.match(src, /OPENCLAW_HOOKS_TOKEN/);
-  assert.match(src, /config", "set", "--json", "hooks\.token"/);
+  assert.match(src, /syncHooksFromEnv/);
+  assert.match(src, /releaseGatewayStart/);
+  assert.doesNotMatch(src, /console\.(log|warn|error)\([^)]*OPENCLAW_HOOKS_TOKEN/);
 });

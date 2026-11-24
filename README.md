@@ -34,7 +34,8 @@ Recommended:
 
 Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
-- `OPENCLAW_HOOKS_TOKEN` — dedicated `hooks.token` for `POST /hooks/*`. When set (and OpenClaw is already configured), the wrapper writes it into the config on startup and after setup. Use a different value from `OPENCLAW_GATEWAY_TOKEN`. Hooks still need `hooks.enabled: true` in the OpenClaw config.
+- `OPENCLAW_HOOKS_TOKEN` — dedicated `hooks.token` for `POST /hooks/*`. When set (and OpenClaw is already configured), the wrapper writes the token and enables hooks on startup and after setup: `hooks.enabled=true`, `hooks.path="/hooks"` (an existing non-default path is kept), `hooks.allowedAgentIds=["main"]` unless that list is already set, and `hooks.allowRequestSessionKey=false`. The gateway is started only after those writes, and restarted if it was already running. Use a different value from `OPENCLAW_GATEWAY_TOKEN`.
+- `OPENCLAW_HOOKS_ENABLED` — set to `false` to store the hook token without enabling hook ingress. Any other value, including unset, enables hooks when `OPENCLAW_HOOKS_TOKEN` is set.
 
 Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
@@ -60,7 +61,7 @@ curl -X POST "https://<your-app>.up.railway.app/hooks/agent" \
   -d '{"message":"Summarize this event","name":"Email","agentId":"main"}'
 ```
 
-`x-openclaw-token: $OPENCLAW_HOOKS_TOKEN` is also accepted. Enable hooks in the OpenClaw config (`hooks.enabled: true`, path `/hooks`) or the gateway will not serve these routes. The Control UI and `/setup` still require `SETUP_PASSWORD`.
+`x-openclaw-token: $OPENCLAW_HOOKS_TOKEN` is also accepted. With `OPENCLAW_HOOKS_TOKEN` set, the wrapper turns hooks on (`hooks.enabled=true`) before the gateway starts, so `POST /hooks/agent` is served without a shell session. Set `OPENCLAW_HOOKS_ENABLED=false` to keep hooks off. The Control UI and `/setup` still require `SETUP_PASSWORD`.
 
 ## Support / community
 
