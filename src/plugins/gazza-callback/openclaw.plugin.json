@@ -1,0 +1,11 @@
+{
+  "id": "gazza-callback",
+  "name": "Gazza callback",
+  "description": "Forwards finished Gazza hook runs to the Railway wrapper.",
+  "activation": { "onStartup": true },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

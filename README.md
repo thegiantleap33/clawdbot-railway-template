@@ -34,8 +34,11 @@ Recommended:
 
 Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
-- `OPENCLAW_HOOKS_TOKEN` — dedicated `hooks.token` for `POST /hooks/*`. When set (and OpenClaw is already configured), the wrapper writes the token and enables hooks on startup and after setup: `hooks.enabled=true`, `hooks.path="/hooks"` (an existing non-default path is kept), `hooks.allowedAgentIds=["main"]` unless that list is already set, and `hooks.allowRequestSessionKey=false`. The gateway is started only after those writes, and restarted if it was already running. Use a different value from `OPENCLAW_GATEWAY_TOKEN`.
+- `OPENCLAW_HOOKS_TOKEN` — dedicated `hooks.token` for `POST /hooks/*`. When set (and OpenClaw is already configured), the wrapper writes the token and enables hooks on startup and after setup: `hooks.enabled=true`, `hooks.path="/hooks"` (an existing non-default path is kept), `hooks.allowedAgentIds=["main"]` unless that list is already set, and `hooks.allowRequestSessionKey=false` unless `OPENCLAW_HOOKS_SESSION_PREFIX` is set. The gateway is started only after those writes, and restarted if it was already running. Use a different value from `OPENCLAW_GATEWAY_TOKEN`.
 - `OPENCLAW_HOOKS_ENABLED` — set to `false` to store the hook token without enabling hook ingress. Any other value, including unset, enables hooks when `OPENCLAW_HOOKS_TOKEN` is set.
+- `OPENCLAW_HOOKS_SESSION_PREFIX` — for example `hook:gazza:`. Lets a caller choose a persistent session key that starts with this prefix (`hooks.allowRequestSessionKey=true` and `hooks.allowedSessionKeyPrefixes`).
+- `OPENCLAW_GROK_CALLBACK_URL` — where the wrapper POSTs the finished reply for a run under that prefix.
+- `OPENCLAW_GROK_CALLBACK_TOKEN` — bearer token for that callback. It is not logged.
 
 Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
@@ -62,6 +65,32 @@ curl -X POST "https://<your-app>.up.railway.app/hooks/agent" \
 ```
 
 `x-openclaw-token: $OPENCLAW_HOOKS_TOKEN` is also accepted. With `OPENCLAW_HOOKS_TOKEN` set, the wrapper turns hooks on (`hooks.enabled=true`) before the gateway starts, so `POST /hooks/agent` is served without a shell session. Set `OPENCLAW_HOOKS_ENABLED=false` to keep hooks off. The Control UI and `/setup` still require `SETUP_PASSWORD`.
+
+### Persistent sessions and reply callbacks
+
+Gazza (or any outside agent) can keep one thread and receive the finished reply. Set `OPENCLAW_HOOKS_SESSION_PREFIX=hook:gazza:` plus `OPENCLAW_GROK_CALLBACK_URL` and `OPENCLAW_GROK_CALLBACK_TOKEN`. Send:
+
+```bash
+curl -X POST "https://<your-app>.up.railway.app/hooks/agent" \
+  -H "Authorization: Bearer $OPENCLAW_HOOKS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Continue the thread","sessionMode":"persistent","sessionKey":"hook:gazza:main","agentId":"main"}'
+```
+
+The HTTP response is `{ "ok": true, "runId": "<id>" }` as soon as the run is admitted. That `runId` is not the id OpenClaw's `agent_end` plugin hook sees: the hook dispatcher mints the HTTP id, and the isolated agent runner mints another one for the model turn. The wrapper remembers the HTTP `runId` with the request `sessionKey`. A small local plugin (`gazza-callback`) listens for `agent_end` and, only when the session key is `hook:gazza:…` or OpenClaw's stored form `agent:<agentId>:hook:gazza:…`, reports the final assistant text to the wrapper. The wrapper pairs that completion with the oldest unmatched admission for the same session and POSTs:
+
+```json
+{
+  "source": "openclaw",
+  "runId": "<id returned by /hooks/agent>",
+  "status": "ok",
+  "reply": "<final assistant text>",
+  "agentId": "main",
+  "sessionKey": "hook:gazza:main"
+}
+```
+
+`Authorization: Bearer $OPENCLAW_GROK_CALLBACK_TOKEN` is set on that request. Ordinary Control UI chats are not forwarded. The POST is retried twice with backoff and does not block the agent run. The wrapper sends it with Node's own `fetch`, not OpenClaw's fetch helper, so OpenClaw's SSRF allowlist does not need `api2.cursor.sh`. The callback token and reply text are not written to the logs.
 
 ## Support / community
 

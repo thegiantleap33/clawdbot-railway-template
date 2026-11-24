@@ -47,11 +47,13 @@ export function isCustomHooksPath(value) {
 // Writes applied with `openclaw config set --json`, same as hooks.token.
 // `allowedAgentIds` is omitted when it is already an array (including []).
 // A non-default hooks.path is left alone.
+// A session prefix opts into persistent caller-selected keys bounded to that prefix.
 export function planHooksConfigWrites({
   token,
   explicitlyDisabled,
   currentPath,
   allowedAgentIds,
+  sessionKeyPrefix,
 }) {
   const writes = [{ path: "hooks.token", value: token }];
   if (explicitlyDisabled) {
@@ -66,6 +68,12 @@ export function planHooksConfigWrites({
   if (!Array.isArray(allowedAgentIds)) {
     writes.push({ path: "hooks.allowedAgentIds", value: ["main"] });
   }
-  writes.push({ path: "hooks.allowRequestSessionKey", value: false });
+  const prefix = String(sessionKeyPrefix ?? "").trim();
+  if (prefix) {
+    writes.push({ path: "hooks.allowRequestSessionKey", value: true });
+    writes.push({ path: "hooks.allowedSessionKeyPrefixes", value: [prefix] });
+  } else {
+    writes.push({ path: "hooks.allowRequestSessionKey", value: false });
+  }
   return writes;
 }

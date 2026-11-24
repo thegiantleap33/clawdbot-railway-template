@@ -59,6 +59,33 @@ test("planHooksConfigWrites treats an empty allowlist as already set", () => {
   assert.equal(writes.find((write) => write.path === "hooks.path").value, "/hooks");
 });
 
+test("planHooksConfigWrites allows a persistent session prefix when configured", () => {
+  const writes = planHooksConfigWrites({
+    token: "hook-env-token",
+    explicitlyDisabled: false,
+    currentPath: "/hooks",
+    allowedAgentIds: ["main"],
+    sessionKeyPrefix: " hook:gazza: ",
+  });
+  assert.equal(writes.find((write) => write.path === "hooks.allowRequestSessionKey").value, true);
+  assert.deepEqual(
+    writes.find((write) => write.path === "hooks.allowedSessionKeyPrefixes").value,
+    ["hook:gazza:"],
+  );
+});
+
+test("planHooksConfigWrites ignores a session prefix when hooks are disabled", () => {
+  const writes = planHooksConfigWrites({
+    token: "hook-env-token",
+    explicitlyDisabled: true,
+    sessionKeyPrefix: "hook:gazza:",
+  });
+  assert.deepEqual(writes, [
+    { path: "hooks.token", value: "hook-env-token" },
+    { path: "hooks.enabled", value: false },
+  ]);
+});
+
 test("planHooksConfigWrites only forces hooks off when explicitly disabled", () => {
   const writes = planHooksConfigWrites({
     token: "hook-env-token",
