@@ -22,6 +22,8 @@ import {
   hooksExplicitlyDisabled,
   parseConfigGetResult,
   planHooksConfigWrites,
+  planWrapperSessionUnsets,
+  resolveHookSessionPrefix,
 } from "./hooks-config.js";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
@@ -1754,12 +1756,23 @@ async function syncHooksFromEnv() {
     allowedAgentIds = agentsResult.found ? agentsResult.value : undefined;
   }
 
+  const sessionPrefix = resolveHookSessionPrefix(OPENCLAW_HOOKS_SESSION_PREFIX);
+  if (!sessionPrefix.ok) {
+    console.warn(`[wrapper] ignoring OPENCLAW_HOOKS_SESSION_PREFIX: ${sessionPrefix.error}`);
+  }
   const writes = planHooksConfigWrites({
     token: OPENCLAW_HOOKS_TOKEN,
     explicitlyDisabled,
     currentPath,
     allowedAgentIds,
-    sessionKeyPrefix: OPENCLAW_HOOKS_SESSION_PREFIX,
+    sessionKeyPrefix: sessionPrefix.ok ? sessionPrefix.prefix : "",
+  });
+  const currentPrefixes = await readHooksConfigValue("hooks.allowedSessionKeyPrefixes");
+  const currentDefault = await readHooksConfigValue("hooks.defaultSessionKey");
+  const unsets = planWrapperSessionUnsets({
+    sessionKeyPrefix: sessionPrefix.ok ? sessionPrefix.prefix : "",
+    allowedSessionKeyPrefixes: currentPrefixes.found ? currentPrefixes.value : undefined,
+    defaultSessionKey: currentDefault.found ? currentDefault.value : undefined,
   });
   if (!explicitlyDisabled && gazzaBridgeReady) {
     const loadPaths = await readHooksConfigValue("plugins.load.paths");
@@ -1780,6 +1793,13 @@ async function syncHooksFromEnv() {
     if (result.code !== 0) {
       failed += 1;
       console.warn(`[wrapper] failed to set ${write.path} (exit ${result.code})`);
+    }
+  }
+  for (const unsetPath of unsets) {
+    const result = await runCmd(OPENCLAW_NODE, clawArgs(["config", "unset", unsetPath]));
+    if (result.code !== 0) {
+      failed += 1;
+      console.warn(`[wrapper] failed to unset ${unsetPath} (exit ${result.code})`);
     }
   }
   return { ok: failed === 0, failed };

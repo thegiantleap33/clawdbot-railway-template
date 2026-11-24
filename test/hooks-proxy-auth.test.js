@@ -556,6 +556,26 @@ test("OPENCLAW_HOOKS_ENABLED=false stores the token and leaves hooks disabled", 
   }
 });
 
+test("clearing the session prefix unsets a crashing allowlist before gateway start", async () => {
+  const booted = await bootWrapper({
+    OPENCLAW_HOOKS_SESSION_PREFIX: "",
+    FAKE_OPENCLAW_GET: JSON.stringify({
+      "hooks.allowedSessionKeyPrefixes": ["hook:gazza:"],
+      "hooks.path": "/hooks",
+      "hooks.allowedAgentIds": ["main"],
+    }),
+  });
+  try {
+    assert.match(booted.beforeGateway, /config unset hooks\.allowedSessionKeyPrefixes/);
+    assert.doesNotMatch(booted.beforeGateway, /config unset hooks\.defaultSessionKey/);
+    assert.doesNotMatch(booted.beforeGateway, /config set --json hooks\.allowedSessionKeyPrefixes/);
+    const unsetAt = booted.beforeGateway.indexOf("config unset hooks.allowedSessionKeyPrefixes");
+    assert.ok(unsetAt >= 0);
+  } finally {
+    await booted.stop();
+  }
+});
+
 test("gazza callback uses the /hooks/agent runId and the final reply", async () => {
   const received = [];
   const callback = http.createServer((req, res) => {
@@ -583,6 +603,8 @@ test("gazza callback uses the /hooks/agent runId and the final reply", async () 
   try {
     assert.match(booted.beforeGateway, /config set --json hooks\.allowRequestSessionKey true/);
     assert.match(booted.beforeGateway, /config set --json hooks\.allowedSessionKeyPrefixes \["hook:gazza:"\]/);
+    assert.match(booted.beforeGateway, /config set --json hooks\.defaultSessionKey "hook:gazza:main"/);
+    assert.doesNotMatch(booted.beforeGateway, /allowedSessionKeyPrefixes \["hook:"\]/);
     assert.match(booted.beforeGateway, /plugins\.entries\.gazza-callback\.enabled true/);
     assert.equal(booted.getLogs().includes("grok-callback-secret"), false);
     assert.equal(booted.getLogs().includes("bridge-test-token"), false);
