@@ -77,6 +77,25 @@ function wsUpgrade(port, reqPath, headers = {}) {
   });
 }
 
+async function readCliLogBeforeGateway(cliLogPath) {
+  const deadline = Date.now() + 2000;
+  let cliLog = "";
+  while (Date.now() < deadline) {
+    try {
+      cliLog = fs.readFileSync(cliLogPath, "utf8");
+    } catch {
+      cliLog = "";
+    }
+    if (cliLog.includes("gateway run")) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const gatewayAt = cliLog.indexOf("gateway run");
+  return {
+    cliLog,
+    beforeGateway: gatewayAt >= 0 ? cliLog.slice(0, gatewayAt) : cliLog,
+  };
+}
+
 function cookieHeader(res) {
   const raw = res.headers["set-cookie"];
   return Array.isArray(raw) ? raw.join("\n") : String(raw || "");
@@ -122,13 +141,19 @@ async function bootWrapper(extraEnv = {}) {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
       hits.push({
         method: req.method,
         url: req.url,
         headers: req.headers,
-        body: Buffer.concat(chunks).toString("utf8"),
+        body,
         upgrade: false,
       });
+      if (req.method === "POST" && req.url === "/hooks/agent") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, runId: "run-from-hooks" }));
+        return;
+      }
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
     });
@@ -166,6 +191,12 @@ async function bootWrapper(extraEnv = {}) {
       OPENCLAW_GATEWAY_TOKEN: "gateway-secret",
       OPENCLAW_HOOKS_TOKEN: "hook-env-token",
       OPENCLAW_HOOKS_ENABLED: "",
+      OPENCLAW_HOOKS_SESSION_PREFIX: "",
+      OPENCLAW_GROK_CALLBACK_URL: "",
+      OPENCLAW_GROK_CALLBACK_TOKEN: "",
+      OPENCLAW_GAZZA_BRIDGE_PORT: "",
+      OPENCLAW_GAZZA_BRIDGE_TOKEN: "",
+      OPENCLAW_GAZZA_BRIDGE_URL: "",
       FAKE_OPENCLAW_LOG: cliLogPath,
       OPENCLAW_ENTRY: entryPath,
       OPENCLAW_NODE: process.execPath,
@@ -207,14 +238,14 @@ async function bootWrapper(extraEnv = {}) {
     try {
       const probe = await httpRequest({ port: publicPort, path: "/healthz" });
       if (probe.status === 200 && logs.includes("gateway ready")) {
-        const cliLog = fs.readFileSync(cliLogPath, "utf8");
-        const gatewayAt = cliLog.indexOf("gateway run");
+        const recorded = await readCliLogBeforeGateway(cliLogPath);
         return {
           port: publicPort,
           hits,
           logs,
-          cliLog,
-          beforeGateway: gatewayAt >= 0 ? cliLog.slice(0, gatewayAt) : "",
+          getLogs: () => logs,
+          cliLog: recorded.cliLog,
+          beforeGateway: recorded.beforeGateway,
           stop,
         };
       }
@@ -307,6 +338,9 @@ test("hooks keep caller auth and unauthenticated websocket upgrades are rejected
       OPENCLAW_GATEWAY_TOKEN: "gateway-secret",
       OPENCLAW_HOOKS_TOKEN: "hook-env-token",
       OPENCLAW_HOOKS_ENABLED: "",
+      OPENCLAW_HOOKS_SESSION_PREFIX: "",
+      OPENCLAW_GROK_CALLBACK_URL: "",
+      OPENCLAW_GROK_CALLBACK_TOKEN: "",
       FAKE_OPENCLAW_LOG: cliLogPath,
       OPENCLAW_ENTRY: entryPath,
       OPENCLAW_NODE: process.execPath,
@@ -356,10 +390,9 @@ test("hooks keep caller auth and unauthenticated websocket upgrades are rejected
     }
     assert.ok(ready, `wrapper did not become ready (last status ${lastStatus})\n${logs}`);
 
-    const cliLog = fs.readFileSync(cliLogPath, "utf8");
-    const gatewayAt = cliLog.indexOf("gateway run");
-    assert.ok(gatewayAt >= 0, cliLog);
-    const beforeGateway = cliLog.slice(0, gatewayAt);
+    const recorded = await readCliLogBeforeGateway(cliLogPath);
+    const cliLog = recorded.cliLog;
+    const beforeGateway = recorded.beforeGateway;
     assert.match(beforeGateway, /config set --json hooks\.token "hook-env-token"/);
     assert.match(beforeGateway, /config set --json hooks\.enabled true/);
     assert.match(beforeGateway, /config set --json hooks\.path "\/hooks"/);
@@ -520,5 +553,121 @@ test("OPENCLAW_HOOKS_ENABLED=false stores the token and leaves hooks disabled", 
     assert.equal(booted.logs.includes("hook-env-token"), false);
   } finally {
     await booted.stop();
+  }
+});
+
+test("gazza callback uses the /hooks/agent runId and the final reply", async () => {
+  const received = [];
+  const callback = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      received.push({
+        auth: req.headers.authorization,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      });
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    });
+  });
+  const callbackPort = await freePort();
+  await new Promise((resolve) => callback.listen(callbackPort, "127.0.0.1", resolve));
+  const bridgePort = await freePort();
+  const booted = await bootWrapper({
+    OPENCLAW_HOOKS_SESSION_PREFIX: "hook:gazza:",
+    OPENCLAW_GROK_CALLBACK_URL: `http://127.0.0.1:${callbackPort}/done`,
+    OPENCLAW_GROK_CALLBACK_TOKEN: "grok-callback-secret",
+    OPENCLAW_GAZZA_BRIDGE_PORT: String(bridgePort),
+    OPENCLAW_GAZZA_BRIDGE_TOKEN: "bridge-test-token",
+  });
+  try {
+    assert.match(booted.beforeGateway, /config set --json hooks\.allowRequestSessionKey true/);
+    assert.match(booted.beforeGateway, /config set --json hooks\.allowedSessionKeyPrefixes \["hook:gazza:"\]/);
+    assert.match(booted.beforeGateway, /plugins\.entries\.gazza-callback\.enabled true/);
+    assert.equal(booted.getLogs().includes("grok-callback-secret"), false);
+    assert.equal(booted.getLogs().includes("bridge-test-token"), false);
+
+    const payload = JSON.stringify({
+      message: "ping",
+      sessionMode: "persistent",
+      sessionKey: "hook:gazza:main",
+    });
+    const hookRes = await httpRequest({
+      port: booted.port,
+      method: "POST",
+      path: "/hooks/agent",
+      headers: {
+        Authorization: "Bearer hook-secret",
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+      },
+      body: payload,
+    });
+    assert.equal(hookRes.status, 200, hookRes.body);
+    assert.equal(JSON.parse(hookRes.body).runId, "run-from-hooks");
+    const gatewayHit = booted.hits.find((hit) => hit.method === "POST" && hit.url === "/hooks/agent");
+    assert.ok(gatewayHit);
+    assert.equal(gatewayHit.body, payload);
+
+    const completion = JSON.stringify({
+      sessionKey: "agent:main:hook:gazza:main",
+      agentId: "main",
+      reply: "The final Gazza reply",
+      success: true,
+    });
+    const bridgeRes = await httpRequest({
+      port: bridgePort,
+      method: "POST",
+      path: "/callback",
+      headers: {
+        Authorization: "Bearer bridge-test-token",
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(completion),
+      },
+      body: completion,
+    });
+    assert.equal(bridgeRes.status, 202, bridgeRes.body);
+
+    const deadline = Date.now() + 3000;
+    while (received.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(received.length, 1);
+    assert.equal(received[0].auth, "Bearer grok-callback-secret");
+    assert.deepEqual(received[0].body, {
+      source: "openclaw",
+      runId: "run-from-hooks",
+      status: "ok",
+      reply: "The final Gazza reply",
+      agentId: "main",
+      sessionKey: "hook:gazza:main",
+    });
+    assert.equal(booted.getLogs().includes("The final Gazza reply"), false);
+    assert.equal(booted.getLogs().includes("grok-callback-secret"), false);
+
+    const ordinary = JSON.stringify({
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      reply: "ordinary chat",
+      success: true,
+    });
+    const ignored = await httpRequest({
+      port: bridgePort,
+      method: "POST",
+      path: "/callback",
+      headers: {
+        Authorization: "Bearer bridge-test-token",
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(ordinary),
+      },
+      body: ordinary,
+    });
+    assert.equal(ignored.status, 202);
+    assert.match(ignored.body, /ignored/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(received.length, 1);
+  } finally {
+    await booted.stop();
+    await new Promise((resolve) => callback.close(resolve));
   }
 });

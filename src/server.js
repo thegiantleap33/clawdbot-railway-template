@@ -3,11 +3,21 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
 
+import {
+  createBridgeToken,
+  createRunCorrelator,
+  gazzaCallbackSettings,
+  planGazzaPluginWrites,
+  sessionKeyMatchesPrefix,
+  startGazzaBridge,
+} from "./gazza-callback.js";
 import {
   hooksExplicitlyDisabled,
   parseConfigGetResult,
@@ -79,6 +89,10 @@ process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 // Dedicated OpenClaw hook ingress secret (hooks.token in openclaw.json).
 // This is not dashboard auth and must not be reused as the gateway token.
 const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN?.trim() || "";
+const OPENCLAW_HOOKS_SESSION_PREFIX = process.env.OPENCLAW_HOOKS_SESSION_PREFIX?.trim() || "";
+const GAZZA_PLUGIN_DIR = fileURLToPath(new URL("./plugins/gazza-callback/", import.meta.url));
+const gazzaRuns = createRunCorrelator();
+let gazzaBridgeReady = false;
 
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
@@ -336,6 +350,24 @@ app.use((req, res, next) => {
   if (isHooksRequest(req)) return next();
   return jsonParser(req, res, next);
 });
+
+// Buffer hook bodies ourselves so we can read sessionKey and still replay
+// the raw bytes to the gateway. express.json() stays off this path.
+function bufferHooksBody(req, res, next) {
+  if (!isHooksRequest(req) || req.method === "GET" || req.method === "HEAD") return next();
+  const chunks = [];
+  let settled = false;
+  const done = () => {
+    if (settled) return;
+    settled = true;
+    req.hooksRawBody = Buffer.concat(chunks);
+    next();
+  };
+  req.on("data", (chunk) => chunks.push(chunk));
+  req.on("error", done);
+  req.on("end", done);
+}
+app.use(bufferHooksBody);
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
@@ -1496,6 +1528,43 @@ proxy.on("proxyReqWs", (proxyReq, req) => {
   attachGatewayAuthHeader(req, proxyReq);
 });
 
+function hookRequestSessionKey(req) {
+  if (!req.hooksRawBody || req.hooksRawBody.length === 0) return "";
+  try {
+    const parsed = JSON.parse(req.hooksRawBody.toString("utf8"));
+    return typeof parsed.sessionKey === "string" ? parsed.sessionKey.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function isHooksAgentPost(req) {
+  return req.method === "POST" && (req.path === "/hooks/agent" || requestPath(req) === "/hooks/agent");
+}
+
+proxy.on("proxyRes", (proxyRes, req) => {
+  if (!OPENCLAW_HOOKS_SESSION_PREFIX || !isHooksAgentPost(req)) return;
+  const sessionKey = hookRequestSessionKey(req);
+  if (!sessionKeyMatchesPrefix(sessionKey, OPENCLAW_HOOKS_SESSION_PREFIX)) return;
+  const chunks = [];
+  proxyRes.on("data", (chunk) => chunks.push(chunk));
+  proxyRes.on("end", () => {
+    try {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (parsed && parsed.ok === true && parsed.runId) {
+        gazzaRuns.noteAdmission({
+          sessionKey,
+          prefix: OPENCLAW_HOOKS_SESSION_PREFIX,
+          httpRunId: String(parsed.runId),
+          requestSessionKey: sessionKey,
+        });
+      }
+    } catch {
+      // A non-JSON hook response is not an admitted run.
+    }
+  });
+});
+
 app.use(requireDashboardAuth, async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
@@ -1519,6 +1588,12 @@ app.use(requireDashboardAuth, async (req, res) => {
   }
 
   attachGatewayAuthHeader(req);
+  if (req.hooksRawBody) {
+    return proxy.web(req, res, {
+      target: GATEWAY_TARGET,
+      buffer: Readable.from([req.hooksRawBody]),
+    });
+  }
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1575,6 +1650,28 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
         console.log("[wrapper] gateway tokens synced");
       } catch (err) {
         console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+      }
+    }
+
+    const gazza = gazzaCallbackSettings();
+    if (gazza.enabled && !hooksExplicitlyDisabled(process.env.OPENCLAW_HOOKS_ENABLED)) {
+      try {
+        const bridgeToken = process.env.OPENCLAW_GAZZA_BRIDGE_TOKEN?.trim() || createBridgeToken();
+        const preferredPort = Number.parseInt(process.env.OPENCLAW_GAZZA_BRIDGE_PORT ?? "", 10);
+        const bridge = await startGazzaBridge({
+          port: Number.isFinite(preferredPort) && preferredPort > 0 ? preferredPort : 0,
+          bridgeToken,
+          prefix: gazza.prefix,
+          callbackUrl: gazza.callbackUrl,
+          callbackToken: gazza.callbackToken,
+          correlator: gazzaRuns,
+        });
+        process.env.OPENCLAW_GAZZA_BRIDGE_URL = bridge.url;
+        process.env.OPENCLAW_GAZZA_BRIDGE_TOKEN = bridgeToken;
+        gazzaBridgeReady = true;
+        console.log(`[wrapper] gazza callback bridge ready for ${gazza.callbackHost}`);
+      } catch (err) {
+        console.warn(`[wrapper] gazza callback bridge failed: ${err && err.message ? err.message : "error"}`);
       }
     }
 
@@ -1662,7 +1759,17 @@ async function syncHooksFromEnv() {
     explicitlyDisabled,
     currentPath,
     allowedAgentIds,
+    sessionKeyPrefix: OPENCLAW_HOOKS_SESSION_PREFIX,
   });
+  if (!explicitlyDisabled && gazzaBridgeReady) {
+    const loadPaths = await readHooksConfigValue("plugins.load.paths");
+    const allowList = await readHooksConfigValue("plugins.allow");
+    writes.push(...planGazzaPluginWrites({
+      pluginDir: GAZZA_PLUGIN_DIR,
+      loadPaths,
+      allowList,
+    }));
+  }
 
   let failed = 0;
   for (const write of writes) {
