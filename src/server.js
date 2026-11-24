@@ -8,6 +8,12 @@ import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
 
+import {
+  hooksExplicitlyDisabled,
+  parseConfigGetResult,
+  planHooksConfigWrites,
+} from "./hooks-config.js";
+
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
 for (const suffix of ["PUBLIC_PORT", "STATE_DIR", "WORKSPACE_DIR", "GATEWAY_TOKEN", "CONFIG_PATH"]) {
@@ -141,6 +147,13 @@ function isConfigured() {
 let gatewayProc = null;
 let gatewayStarting = null;
 
+// Hold gateway startup until the boot callback has written hooks config.
+// Otherwise a request can spawn the gateway while hooks.enabled is still false.
+let releaseGatewayStart = () => {};
+const gatewayStartGate = new Promise((resolve) => {
+  releaseGatewayStart = resolve;
+});
+
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
 let lastGatewayExit = null;
@@ -235,6 +248,7 @@ async function runDoctorBestEffort() {
 }
 
 async function ensureGatewayRunning() {
+  await gatewayStartGate;
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
   if (!gatewayStarting) {
@@ -773,8 +787,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
 
     if (OPENCLAW_HOOKS_TOKEN) {
-      const hooksSet = await syncHooksTokenFromEnv();
-      extra += `\n[hooks.token] exit=${hooksSet.code} (output ${hooksSet.output.length} chars)\n${hooksSet.output || "(no output)"}`;
+      await syncHooksFromEnv();
     }
 
     // Railway runs behind a reverse proxy. Trust loopback as a proxy hop so local client detection
@@ -900,6 +913,15 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     // This makes Telegram/Discord pairing issues much less "silent".
     const fix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
     extra += `\n[doctor --fix] exit=${fix.code} (output ${fix.output.length} chars)\n${fix.output || "(no output)"}`;
+
+    // Doctor can rewrite config. Apply hooks again so the gateway that stays up
+    // sees hooks.enabled and does not log hooks-disabled.
+    if (OPENCLAW_HOOKS_TOKEN) {
+      const hooksSync = await syncHooksFromEnv();
+      extra += hooksSync.ok
+        ? "\n[hooks] config synced\n"
+        : `\n[hooks] config sync failed (${hooksSync.failed} update(s))\n`;
+    }
 
     // Doctor may require a restart depending on changes.
     await restartGateway();
@@ -1501,68 +1523,84 @@ app.use(requireDashboardAuth, async (req, res) => {
 });
 
 const server = app.listen(PORT, "0.0.0.0", async () => {
-  console.log(`[wrapper] listening on :${PORT}`);
-  console.log(`[wrapper] state dir: ${STATE_DIR}`);
-  console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
-
-  // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
   try {
-    fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true });
-  } catch {}
-  try {
-    fs.chmodSync(STATE_DIR, 0o700);
-  } catch {}
+    console.log(`[wrapper] listening on :${PORT}`);
+    console.log(`[wrapper] state dir: ${STATE_DIR}`);
+    console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
 
-  console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
-  console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
-  if (!SETUP_PASSWORD) {
-    console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
-  }
-
-  // Optional operator hook to install/persist extra tools under /data.
-  // This is intentionally best-effort and should be used to set up persistent
-  // prefixes (npm/pnpm/python venv), not to mutate the base image.
-  const bootstrapPath = path.join(WORKSPACE_DIR, "bootstrap.sh");
-  if (fs.existsSync(bootstrapPath)) {
-    console.log(`[wrapper] running bootstrap: ${bootstrapPath}`);
+    // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
     try {
-      await runCmd("bash", [bootstrapPath], {
-        env: {
-          ...process.env,
-          OPENCLAW_STATE_DIR: STATE_DIR,
-          OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-        },
-        timeoutMs: 10 * 60 * 1000,
-      });
-      console.log("[wrapper] bootstrap complete");
-    } catch (err) {
-      console.warn(`[wrapper] bootstrap failed (continuing): ${String(err)}`);
+      fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true });
+    } catch {}
+    try {
+      fs.chmodSync(STATE_DIR, 0o700);
+    } catch {}
+
+    console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
+    console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
+    if (!SETUP_PASSWORD) {
+      console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
     }
-  }
 
-  // Sync gateway tokens in config with the current env var on every startup.
-  // This prevents "gateway token mismatch" when OPENCLAW_GATEWAY_TOKEN changes
-  // (e.g. Railway variable update) but the config file still has the old value.
-  if (isConfigured() && OPENCLAW_GATEWAY_TOKEN) {
-    console.log("[wrapper] syncing gateway tokens in config...");
-    try {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
-      console.log("[wrapper] gateway tokens synced");
-    } catch (err) {
-      console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+    // Optional operator hook to install/persist extra tools under /data.
+    // This is intentionally best-effort and should be used to set up persistent
+    // prefixes (npm/pnpm/python venv), not to mutate the base image.
+    const bootstrapPath = path.join(WORKSPACE_DIR, "bootstrap.sh");
+    if (fs.existsSync(bootstrapPath)) {
+      console.log(`[wrapper] running bootstrap: ${bootstrapPath}`);
+      try {
+        await runCmd("bash", [bootstrapPath], {
+          env: {
+            ...process.env,
+            OPENCLAW_STATE_DIR: STATE_DIR,
+            OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+          },
+          timeoutMs: 10 * 60 * 1000,
+        });
+        console.log("[wrapper] bootstrap complete");
+      } catch (err) {
+        console.warn(`[wrapper] bootstrap failed (continuing): ${String(err)}`);
+      }
     }
+
+    // Sync gateway tokens in config with the current env var on every startup.
+    // This prevents "gateway token mismatch" when OPENCLAW_GATEWAY_TOKEN changes
+    // (e.g. Railway variable update) but the config file still has the old value.
+    if (isConfigured() && OPENCLAW_GATEWAY_TOKEN) {
+      console.log("[wrapper] syncing gateway tokens in config...");
+      try {
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+        await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+        console.log("[wrapper] gateway tokens synced");
+      } catch (err) {
+        console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+      }
+    }
+
+    if (isConfigured() && OPENCLAW_HOOKS_TOKEN) {
+      console.log("[wrapper] syncing hooks config...");
+      try {
+        const hooksSync = await syncHooksFromEnv();
+        if (hooksSync.ok) console.log("[wrapper] hooks config synced");
+        else console.warn(`[wrapper] hooks config sync had ${hooksSync.failed} failure(s)`);
+      } catch (err) {
+        console.warn(`[wrapper] failed to sync hooks config: ${String(err)}`);
+      }
+    }
+  } finally {
+    releaseGatewayStart();
   }
 
-  if (isConfigured() && OPENCLAW_HOOKS_TOKEN) {
-    console.log("[wrapper] syncing hooks.token in config...");
+  // A request can pass the gate only after the writes above. If one already
+  // spawned the gateway (or a future caller starts it early), reload it so
+  // hooks.enabled is not stuck false.
+  if (isConfigured() && OPENCLAW_HOOKS_TOKEN && gatewayProc) {
+    console.log("[wrapper] restarting gateway to apply hooks config");
     try {
-      const hooksSet = await syncHooksTokenFromEnv();
-      if (hooksSet.code === 0) console.log("[wrapper] hooks.token synced");
-      else console.warn(`[wrapper] failed to sync hooks.token (exit ${hooksSet.code})`);
+      await restartGateway();
     } catch (err) {
-      console.warn(`[wrapper] failed to sync hooks.token: ${String(err)}`);
+      console.warn(`[wrapper] gateway restart after hooks sync failed: ${String(err)}`);
     }
   }
 
@@ -1601,11 +1639,43 @@ function rejectUpgrade(socket, statusCode, message) {
   }
 }
 
-async function syncHooksTokenFromEnv() {
-  return runCmd(
-    OPENCLAW_NODE,
-    clawArgs(["config", "set", "--json", "hooks.token", JSON.stringify(OPENCLAW_HOOKS_TOKEN)]),
-  );
+async function readHooksConfigValue(dotPath) {
+  const result = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", dotPath, "--json"]));
+  return parseConfigGetResult(result.code, result.output);
+}
+
+// Writes hooks.token plus the enablement fields, via `openclaw config set --json`.
+// Never logs token values or command output (the CLI may echo the secret).
+async function syncHooksFromEnv() {
+  const explicitlyDisabled = hooksExplicitlyDisabled(process.env.OPENCLAW_HOOKS_ENABLED);
+  let currentPath;
+  let allowedAgentIds;
+  if (!explicitlyDisabled) {
+    const pathResult = await readHooksConfigValue("hooks.path");
+    currentPath = pathResult.found ? pathResult.value : undefined;
+    const agentsResult = await readHooksConfigValue("hooks.allowedAgentIds");
+    allowedAgentIds = agentsResult.found ? agentsResult.value : undefined;
+  }
+
+  const writes = planHooksConfigWrites({
+    token: OPENCLAW_HOOKS_TOKEN,
+    explicitlyDisabled,
+    currentPath,
+    allowedAgentIds,
+  });
+
+  let failed = 0;
+  for (const write of writes) {
+    const result = await runCmd(
+      OPENCLAW_NODE,
+      clawArgs(["config", "set", "--json", write.path, JSON.stringify(write.value)]),
+    );
+    if (result.code !== 0) {
+      failed += 1;
+      console.warn(`[wrapper] failed to set ${write.path} (exit ${result.code})`);
+    }
+  }
+  return { ok: failed === 0, failed };
 }
 
 server.on("upgrade", async (req, socket, head) => {

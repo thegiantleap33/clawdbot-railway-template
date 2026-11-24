@@ -82,6 +82,152 @@ function cookieHeader(res) {
   return Array.isArray(raw) ? raw.join("\n") : String(raw || "");
 }
 
+function fakeOpenClawSource() {
+  return [
+    "const fs = require('node:fs');",
+    "const args = process.argv.slice(2);",
+    "if (process.env.FAKE_OPENCLAW_LOG) {",
+    "  fs.appendFileSync(process.env.FAKE_OPENCLAW_LOG, args.join(' ') + '\\n');",
+    "}",
+    "if (args[0] === 'config' && args[1] === 'get') {",
+    "  let map = {};",
+    "  try { map = JSON.parse(process.env.FAKE_OPENCLAW_GET || '{}'); } catch {}",
+    "  const key = args[2];",
+    "  if (Object.prototype.hasOwnProperty.call(map, key)) {",
+    "    process.stdout.write(JSON.stringify(map[key]));",
+    "    process.exit(0);",
+    "  }",
+    "  process.exit(1);",
+    "}",
+    "if (args[0] === 'gateway' && args.includes('run')) {",
+    "  setInterval(() => {}, 60 * 60 * 1000);",
+    "} else {",
+    "  process.exit(0);",
+    "}",
+    "",
+  ].join("\n");
+}
+
+// Boots the wrapper against a fake gateway and resolves once hooks config has been
+// written and the gateway process has started. Caller must invoke stop().
+async function bootWrapper(extraEnv = {}) {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-wrapper-"));
+  const entryPath = path.join(stateDir, "fake-openclaw.cjs");
+  const cliLogPath = path.join(stateDir, "cli.log");
+  fs.writeFileSync(path.join(stateDir, "openclaw.json"), "{}\n");
+  fs.writeFileSync(entryPath, fakeOpenClawSource());
+
+  const hits = [];
+  const mock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      hits.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+        upgrade: false,
+      });
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    });
+  });
+  mock.on("upgrade", (req, socket) => {
+    hits.push({ method: req.method, url: req.url, headers: req.headers, body: "", upgrade: true });
+    const key = String(req.headers["sec-websocket-key"] || "");
+    const accept = crypto
+      .createHash("sha1")
+      .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    socket.end();
+  });
+
+  const gatewayPort = await freePort();
+  await new Promise((resolve) => mock.listen(gatewayPort, "127.0.0.1", resolve));
+  const publicPort = await freePort();
+  const child = spawn(process.execPath, ["src/server.js"], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PORT: String(publicPort),
+      SETUP_PASSWORD: "test-password",
+      OPENCLAW_STATE_DIR: stateDir,
+      OPENCLAW_WORKSPACE_DIR: path.join(stateDir, "workspace"),
+      OPENCLAW_CONFIG_PATH: path.join(stateDir, "openclaw.json"),
+      INTERNAL_GATEWAY_HOST: "127.0.0.1",
+      INTERNAL_GATEWAY_PORT: String(gatewayPort),
+      OPENCLAW_GATEWAY_TOKEN: "gateway-secret",
+      OPENCLAW_HOOKS_TOKEN: "hook-env-token",
+      OPENCLAW_HOOKS_ENABLED: "",
+      FAKE_OPENCLAW_LOG: cliLogPath,
+      OPENCLAW_ENTRY: entryPath,
+      OPENCLAW_NODE: process.execPath,
+      ...extraEnv,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let logs = "";
+  child.stdout.on("data", (chunk) => {
+    logs += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    logs += chunk.toString();
+  });
+
+  const stop = async () => {
+    if (child.exitCode === null && !child.killed) {
+      const exited = new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          resolve();
+        }, 2000);
+        child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      child.kill("SIGTERM");
+      await exited;
+    }
+    await new Promise((resolve) => mock.close(resolve));
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  };
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (logs.includes("gateway failed to start")) break;
+    try {
+      const probe = await httpRequest({ port: publicPort, path: "/healthz" });
+      if (probe.status === 200 && logs.includes("gateway ready")) {
+        const cliLog = fs.readFileSync(cliLogPath, "utf8");
+        const gatewayAt = cliLog.indexOf("gateway run");
+        return {
+          port: publicPort,
+          hits,
+          logs,
+          cliLog,
+          beforeGateway: gatewayAt >= 0 ? cliLog.slice(0, gatewayAt) : "",
+          stop,
+        };
+      }
+    } catch {
+      // still binding
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const detail = logs;
+  await stop();
+  throw new Error(`wrapper did not become ready\n${detail}`);
+}
+
 test("hooks keep caller auth and unauthenticated websocket upgrades are rejected", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-wrapper-"));
   const entryPath = path.join(stateDir, "fake-openclaw.cjs");
@@ -160,6 +306,7 @@ test("hooks keep caller auth and unauthenticated websocket upgrades are rejected
       INTERNAL_GATEWAY_PORT: String(gatewayPort),
       OPENCLAW_GATEWAY_TOKEN: "gateway-secret",
       OPENCLAW_HOOKS_TOKEN: "hook-env-token",
+      OPENCLAW_HOOKS_ENABLED: "",
       FAKE_OPENCLAW_LOG: cliLogPath,
       OPENCLAW_ENTRY: entryPath,
       OPENCLAW_NODE: process.execPath,
@@ -210,7 +357,15 @@ test("hooks keep caller auth and unauthenticated websocket upgrades are rejected
     assert.ok(ready, `wrapper did not become ready (last status ${lastStatus})\n${logs}`);
 
     const cliLog = fs.readFileSync(cliLogPath, "utf8");
-    assert.match(cliLog, /config set --json hooks\.token "hook-env-token"/);
+    const gatewayAt = cliLog.indexOf("gateway run");
+    assert.ok(gatewayAt >= 0, cliLog);
+    const beforeGateway = cliLog.slice(0, gatewayAt);
+    assert.match(beforeGateway, /config set --json hooks\.token "hook-env-token"/);
+    assert.match(beforeGateway, /config set --json hooks\.enabled true/);
+    assert.match(beforeGateway, /config set --json hooks\.path "\/hooks"/);
+    assert.match(beforeGateway, /config set --json hooks\.allowedAgentIds \["main"\]/);
+    assert.match(beforeGateway, /config set --json hooks\.allowRequestSessionKey false/);
+    assert.equal(logs.includes("hook-env-token"), false);
 
     const payload = JSON.stringify({ message: "hello from hook", name: "Email" });
     const hookRes = await httpRequest({
@@ -332,5 +487,38 @@ test("hooks keep caller auth and unauthenticated websocket upgrades are rejected
     await stopChild();
     await new Promise((resolve) => mock.close(resolve));
     fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("startup keeps a custom hooks path and an existing agent allowlist", async () => {
+  const booted = await bootWrapper({
+    FAKE_OPENCLAW_GET: JSON.stringify({
+      "hooks.path": "/custom",
+      "hooks.allowedAgentIds": ["ops"],
+    }),
+  });
+  try {
+    assert.match(booted.beforeGateway, /config set --json hooks\.enabled true/);
+    assert.match(booted.beforeGateway, /config set --json hooks\.allowRequestSessionKey false/);
+    assert.match(booted.beforeGateway, /config set --json hooks\.token "hook-env-token"/);
+    assert.doesNotMatch(booted.beforeGateway, /config set --json hooks\.path/);
+    assert.doesNotMatch(booted.beforeGateway, /config set --json hooks\.allowedAgentIds/);
+    assert.equal(booted.logs.includes("hook-env-token"), false);
+  } finally {
+    await booted.stop();
+  }
+});
+
+test("OPENCLAW_HOOKS_ENABLED=false stores the token and leaves hooks disabled", async () => {
+  const booted = await bootWrapper({ OPENCLAW_HOOKS_ENABLED: "false" });
+  try {
+    assert.match(booted.beforeGateway, /config set --json hooks\.token "hook-env-token"/);
+    assert.match(booted.beforeGateway, /config set --json hooks\.enabled false/);
+    assert.doesNotMatch(booted.beforeGateway, /config set --json hooks\.path/);
+    assert.doesNotMatch(booted.beforeGateway, /config set --json hooks\.allowedAgentIds/);
+    assert.doesNotMatch(booted.beforeGateway, /config set --json hooks\.allowRequestSessionKey/);
+    assert.equal(booted.logs.includes("hook-env-token"), false);
+  } finally {
+    await booted.stop();
   }
 });
