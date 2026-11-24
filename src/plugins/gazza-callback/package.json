@@ -2,7 +2,7 @@
   "name": "gazza-callback",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
+  "type": "commonjs",
   "openclaw": {
     "extensions": ["./index.js"]
   }
